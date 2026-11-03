@@ -141,6 +141,7 @@ static int opt_pin = 0;
 /* Inquiry */
 static int opt_rssi = 0;			/* inquiry_with_rssi (obsolete flag) */
 static int opt_imode = 0;			/* inquiry mode */
+static int opt_ssp = 0;				/* secure simple pairing */
 static int opt_inquiry = 0;
 #define INQUIRY_LENGTH		10	/* seconds */
 #define INQUIRY_MAX_RESPONSES	10
@@ -194,6 +195,8 @@ static struct parameter {
 	{ "inq",	P_SET,	&opt_inquiry,	NULL	},
 	{ "inquiry",	P_SET,	&opt_inquiry,	NULL	},
 	{ "imode",	P_VAL,	&opt_imode,	imodes	},
+	{ "ssp",	P_SET,	&opt_ssp,	NULL	},
+	{ "-ssp",	P_CLR,	&opt_ssp,	NULL	},
 	{ "rssi",	P_SET,	&opt_rssi,	NULL	},
 	{ "-rssi",	P_CLR,	&opt_rssi,	NULL	},
 	{ "reset",	P_SET,	&opt_reset,	NULL	},
@@ -600,6 +603,34 @@ config_unit(void)
 			val = opt_imode - 1;
 
 		save_value(HCI_CMD_WRITE_INQUIRY_MODE, &val, sizeof(val));
+	}
+
+	if (opt_ssp) {
+		uint8_t mode = (opt_ssp > 0 ? 1 : 0);
+
+		/*
+		 * Secure Simple Pairing needs its events, which the default
+		 * event mask (bits 0-44, the state after HCI_Reset) leaves
+		 * out: IO Capability Request/Response, User Confirmation
+		 * Request, User Passkey Request, Remote OOB Data Request,
+		 * Simple Pairing Complete (bits 48-53), User Passkey and
+		 * Keypress Notification (58, 59). Extended Inquiry Result
+		 * (46) and LE Meta (61) are kept as well. bthcid(8) answers
+		 * them.
+		 */
+		if (mode) {
+			uint64_t mask = 0x00001fffffffffffULL | (1ULL << 46)
+			    | (0x3fULL << 48) | (1ULL << 58) | (1ULL << 59)
+			    | (1ULL << 61);
+			uint8_t m[8];
+			int i;
+
+			for (i = 0; i < 8; i++)
+				m[i] = (uint8_t)(mask >> (8 * i));
+
+			save_value(HCI_CMD_SET_EVENT_MASK, m, sizeof(m));
+		}
+		save_value(HCI_CMD_WRITE_SIMPLE_PAIRING_MODE, &mode, sizeof(mode));
 	}
 }
 

@@ -40,6 +40,7 @@ void		 save_key		(bdaddr_t *, bdaddr_t *, uint8_t *);
 int		 init_control		(const char *, mode_t);
 int		 send_client_request	(bdaddr_t *, bdaddr_t *, int);
 uint8_t		*lookup_pin		(bdaddr_t *, bdaddr_t *);
+int		 peek_pin		(bdaddr_t *, bdaddr_t *);
 
 /* hci.c */
 int		 init_hci		(const char *);

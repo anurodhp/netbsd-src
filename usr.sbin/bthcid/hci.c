@@ -80,6 +80,8 @@ static int process_link_key_request_event
 static int process_link_key_notification_event
 		(int, struct sockaddr_bt *, hci_link_key_notification_ep *);
 
+static void process_ssp_event
+	(int, struct sockaddr_bt *, hci_event_hdr_t *);
 static int send_link_key_reply
 		(int, struct sockaddr_bt *, bdaddr_t *, uint8_t *);
 static int send_hci_cmd
@@ -103,6 +105,13 @@ init_hci(const char *device)
 	bt_devfilter_evt_set(&filter, HCI_EVENT_PIN_CODE_REQ);
 	bt_devfilter_evt_set(&filter, HCI_EVENT_LINK_KEY_REQ);
 	bt_devfilter_evt_set(&filter, HCI_EVENT_LINK_KEY_NOTIFICATION);
+	/* Secure Simple Pairing (btconfig <dev> ssp enables it) */
+	bt_devfilter_evt_set(&filter, HCI_EVENT_IO_CAPABILITY_REQ);
+	bt_devfilter_evt_set(&filter, HCI_EVENT_IO_CAPABILITY_RSP);
+	bt_devfilter_evt_set(&filter, HCI_EVENT_USER_CONFIRM_REQ);
+	bt_devfilter_evt_set(&filter, HCI_EVENT_USER_PASSKEY_REQ);
+	bt_devfilter_evt_set(&filter, HCI_EVENT_USER_PASSKEY_NOTIFICATION);
+	bt_devfilter_evt_set(&filter, HCI_EVENT_SIMPLE_PAIRING_COMPL);
 	if (bt_devfilter(hci, &filter, NULL) < 0) {
 		close(hci);
 		return -1;
@@ -161,6 +170,15 @@ process_hci(int sock, short ev, void *arg)
 			(hci_link_key_notification_ep *)(event + 1));
 		break;
 
+	case HCI_EVENT_IO_CAPABILITY_REQ:
+	case HCI_EVENT_IO_CAPABILITY_RSP:
+	case HCI_EVENT_USER_CONFIRM_REQ:
+	case HCI_EVENT_USER_PASSKEY_REQ:
+	case HCI_EVENT_USER_PASSKEY_NOTIFICATION:
+	case HCI_EVENT_SIMPLE_PAIRING_COMPL:
+		process_ssp_event(sock, &addr, event);
+		break;
+
 	default:
 		syslog(LOG_ERR, "Received unexpected HCI event, "
 				"event=%#x", event->event);
@@ -168,6 +186,124 @@ process_hci(int sock, short ev, void *arg)
 	}
 
 	return;
+}
+
+/*
+ * Secure Simple Pairing (Bluetooth 2.1+), added for the iokit port; NetBSD's
+ * bthcid handles legacy PIN pairing only. Pairing must be authorized the
+ * same way: a PIN given with btpin(1) for the device (its value is used
+ * only for a User Passkey Request). This host has a display (the console)
+ * and a yes/no answer (the btpin authorization), so it reports DisplayYesNo
+ * with general bonding and no MITM requirement: a mouse then pairs with
+ * Just Works, a keyboard with Passkey Entry -- the passkey is printed on the
+ * console and in the log, to be typed on the keyboard.
+ */
+static void
+process_ssp_event(int sock, struct sockaddr_bt *addr, hci_event_hdr_t *event)
+{
+	bdaddr_t *bdaddr = (bdaddr_t *)(event + 1);
+	uint8_t *pin;
+
+	switch (event->event) {
+	case HCI_EVENT_IO_CAPABILITY_REQ:
+		syslog(LOG_DEBUG, "Got IO_Capability_Request event from %s, "
+		    "remote bdaddr %s", dev_name, bt_ntoa(bdaddr, NULL));
+		if (peek_pin(&addr->bt_bdaddr, bdaddr)) {
+			hci_io_capability_rep_cp cp;
+
+			memset(&cp, 0, sizeof(cp));
+			bdaddr_copy(&cp.bdaddr, bdaddr);
+			cp.io_cap = 0x01;	/* DisplayYesNo */
+			cp.oob_data = 0;
+			cp.auth_req = 0x04;		/* general bonding, no MITM */
+			send_hci_cmd(sock, addr, HCI_CMD_IO_CAPABILITY_REP,
+			    sizeof(cp), &cp);
+		} else {
+			uint8_t cp[sizeof(bdaddr_t) + 1];
+
+			syslog(LOG_NOTICE, "Pairing with %s not authorized "
+			    "(use btpin -a %s)", bt_ntoa(bdaddr, NULL),
+			    bt_ntoa(bdaddr, NULL));
+			memcpy(cp, bdaddr, sizeof(bdaddr_t));
+			cp[sizeof(bdaddr_t)] = 0x18;	/* Pairing Not Allowed */
+			send_hci_cmd(sock, addr, HCI_CMD_IO_CAPABILITY_NEG_REP,
+			    sizeof(cp), cp);
+		}
+		break;
+
+	case HCI_EVENT_IO_CAPABILITY_RSP: {
+		hci_io_capability_rsp_ep *ep = (void *)(event + 1);
+
+		syslog(LOG_DEBUG, "%s: IO capability %d, auth requirement %#x",
+		    bt_ntoa(&ep->bdaddr, NULL), ep->io_capability,
+		    ep->auth_requirement);
+		break;
+	}
+
+	case HCI_EVENT_USER_CONFIRM_REQ: {
+		hci_user_confirm_req_ep *ep = (void *)(event + 1);
+		hci_user_confirm_rep_cp cp;
+
+		bdaddr_copy(&cp.bdaddr, &ep->bdaddr);
+		if (lookup_pin(&addr->bt_bdaddr, &ep->bdaddr) != NULL) {
+			syslog(LOG_NOTICE, "Confirming pairing with %s "
+			    "(value %06u)", bt_ntoa(&ep->bdaddr, NULL),
+			    (unsigned)le32toh(ep->value));
+			send_hci_cmd(sock, addr, HCI_CMD_USER_CONFIRM_REP,
+			    sizeof(cp), &cp);
+		} else
+			send_hci_cmd(sock, addr, HCI_CMD_USER_CONFIRM_NEG_REP,
+			    sizeof(cp), &cp);
+		break;
+	}
+
+	case HCI_EVENT_USER_PASSKEY_REQ:
+		pin = lookup_pin(&addr->bt_bdaddr, bdaddr);
+		if (pin != NULL) {
+			hci_user_passkey_rep_cp cp;
+			char num[HCI_PIN_SIZE + 1];
+
+			memcpy(num, pin, HCI_PIN_SIZE);
+			num[HCI_PIN_SIZE] = '\0';
+			bdaddr_copy(&cp.bdaddr, bdaddr);
+			cp.value = htole32((uint32_t)strtoul(num, NULL, 10));
+			send_hci_cmd(sock, addr, HCI_CMD_USER_PASSKEY_REP,
+			    sizeof(cp), &cp);
+		} else
+			send_hci_cmd(sock, addr, HCI_CMD_USER_PASSKEY_NEG_REP,
+			    sizeof(bdaddr_t), bdaddr);
+		break;
+
+	case HCI_EVENT_USER_PASSKEY_NOTIFICATION: {
+		hci_user_passkey_notification_ep *ep = (void *)(event + 1);
+		FILE *f;
+
+		syslog(LOG_NOTICE, "Passkey for %s: %06u -- type it on the "
+		    "device, then Enter", bt_ntoa(&ep->bdaddr, NULL),
+		    (unsigned)le32toh(ep->value));
+		if ((f = fopen("/dev/console", "w")) != NULL) {
+			fprintf(f, "bthcid: passkey for %s: %06u -- type it "
+			    "on the device, then Enter\n",
+			    bt_ntoa(&ep->bdaddr, NULL),
+			    (unsigned)le32toh(ep->value));
+			fclose(f);
+		}
+		break;
+	}
+
+	case HCI_EVENT_SIMPLE_PAIRING_COMPL: {
+		hci_simple_pairing_compl_ep *ep = (void *)(event + 1);
+
+		syslog(ep->status ? LOG_NOTICE : LOG_DEBUG,
+		    "Simple pairing with %s %s (status %#x)",
+		    bt_ntoa(&ep->bdaddr, NULL),
+		    ep->status ? "failed" : "complete", ep->status);
+		/* the authorization is used up (Passkey Entry and Just Works
+		 * with a NoInputNoOutput device take it here) */
+		(void)lookup_pin(&addr->bt_bdaddr, &ep->bdaddr);
+		break;
+	}
+	}
 }
 
 /* Process PIN_Code_Request event */

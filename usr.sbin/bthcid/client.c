@@ -347,3 +347,31 @@ lookup_pin(bdaddr_t *laddr, bdaddr_t *raddr)
 
 	return NULL;
 }
+
+/*
+ * Secure Simple Pairing (added for the iokit port): is there a cached PIN
+ * for raddr? A PIN given with btpin(1) is how a user authorizes pairing
+ * with a device; SSP needs no PIN, so hci.c checks for one without taking
+ * it, then takes it (lookup_pin) once the pairing it authorized is done.
+ */
+int
+peek_pin(bdaddr_t *laddr, bdaddr_t *raddr)
+{
+	struct item *item;
+
+	LIST_FOREACH(item, &item_list, next) {
+		if (bdaddr_same(raddr, &item->raddr) == 0)
+			continue;
+
+		if (bdaddr_same(laddr, &item->laddr) == 0
+		    && bdaddr_any(&item->laddr) == 0)
+			continue;
+
+		if (item->hci >= 0)
+			continue;
+
+		return 1;
+	}
+
+	return 0;
+}
