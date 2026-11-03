@@ -109,7 +109,12 @@ server_init(server_t *srv, char const *control, char const *sgroup)
 		goto fail;
 	}
 
+#ifdef __APPLE__
+	/* Darwin: credentials come from LOCAL_PEERCRED, not a control message */
+	srv->ctllen = CMSG_SPACE(sizeof(int));
+#else
 	srv->ctllen = CMSG_SPACE(SOCKCREDSIZE(MAX_GROUPS));
+#endif
 	srv->ctlbuf = malloc(srv->ctllen);
 	if (srv->ctlbuf == NULL) {
 		log_crit("Malloc cmsg buffer (len=%zu) failed.", srv->ctllen);
@@ -164,9 +169,11 @@ server_open_control(server_t *srv, char const *control)
 		return false;
 	}
 
+#ifndef __APPLE__
 	opt = 1;
 	if (setsockopt(fd, SOL_LOCAL, LOCAL_CREDS, &opt, sizeof(opt)) == -1)
 		log_crit("Warning: No credential checks on control socket");
+#endif
 
 	memset(&un, 0, sizeof(un));
 	un.sun_len = sizeof(un);
@@ -455,11 +462,27 @@ server_process_request(server_t *srv, int fd)
 		log_info("Truncated message on %s socket",
 		    srv->fdidx[fd].control ? "control" : "L2CAP");
 
+#ifdef __APPLE__
+	/*
+	 * Darwin has no LOCAL_CREDS/SCM_CREDS; the peer of a local socket is
+	 * read with LOCAL_PEERCRED (struct xucred, sys/un.h and sys/ucred.h).
+	 */
+	(void)cmsg;
+	if (srv->fdidx[fd].control) {
+		struct xucred xuc;
+		socklen_t xlen = sizeof(xuc);
+
+		if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &xuc, &xlen) == 0
+		    && xuc.cr_version == XUCRED_VERSION)
+			srv->fdidx[fd].priv = server_auth_check(srv, &xuc);
+	}
+#else
 	if ((cmsg = CMSG_FIRSTHDR(&msg)) != NULL
 	    && cmsg->cmsg_level == SOL_SOCKET
 	    && cmsg->cmsg_type == SCM_CREDS
 	    && cmsg->cmsg_len >= CMSG_LEN(SOCKCREDSIZE(0)))
 		srv->fdidx[fd].priv = server_auth_check(srv, CMSG_DATA(cmsg));
+#endif
 
 	srv->pdu.len = be16toh(srv->pdu.len);
 
@@ -577,6 +600,38 @@ server_close_fd(server_t *srv, int fd)
 /*
  * check credentials, return true when permitted to modify service records
  */
+#ifdef __APPLE__
+static bool
+server_auth_check(server_t *srv, void *data)
+{
+	struct xucred *cred = data;
+	struct group *grp;
+	int n;
+
+	if (cred == NULL)
+		return false;
+
+	if (cred->cr_uid == 0)
+		return true;
+
+	if (srv->sgroup == NULL)
+		return false;
+
+	grp = getgrnam(srv->sgroup);
+	if (grp == NULL) {
+		log_err("No gid for group '%s'", srv->sgroup);
+		srv->sgroup = NULL;
+		return false;
+	}
+
+	for (n = 0 ; n < cred->cr_ngroups ; n++) {
+		if (cred->cr_groups[n] == grp->gr_gid)
+			return true;
+	}
+
+	return false;
+}
+#else
 static bool
 server_auth_check(server_t *srv, void *data)
 {
@@ -617,3 +672,4 @@ server_auth_check(server_t *srv, void *data)
 
 	return false;
 }
+#endif

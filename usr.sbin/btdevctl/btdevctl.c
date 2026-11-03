@@ -232,6 +232,53 @@ uppercase(const char *arg)
 	return str;
 }
 
+#ifdef __APPLE__
+/*
+ * xnu has no /dev/bthub, NetBSD's attach point for the kernel bthidev and
+ * btsco drivers. HID devices are served from user space by bthidd(8)
+ * instead: attaching marks the device "attached" in the btdevctl cache
+ * (detaching clears it), and bthidd, which serves every attached HID
+ * device in the cache, rereads it on SIGHUP.
+ */
+#include <signal.h>
+#include <stdio.h>
+
+#define BTHIDD_PIDFILE	"/var/run/bthidd.pid"
+
+static int
+bthub_pioctl(unsigned long cmd, prop_dictionary_t dict)
+{
+	bdaddr_t laddr, raddr;
+	prop_data_t d;
+	const char *service;
+	FILE *f;
+	int pid;
+
+	d = prop_dictionary_get(dict, BTDEVladdr);
+	if (d == NULL || prop_data_size(d) != sizeof(laddr))
+		errx(EXIT_FAILURE, "no %s", BTDEVladdr);
+	memcpy(&laddr, prop_data_value(d), sizeof(laddr));
+	d = prop_dictionary_get(dict, BTDEVraddr);
+	if (d == NULL || prop_data_size(d) != sizeof(raddr))
+		errx(EXIT_FAILURE, "no %s", BTDEVraddr);
+	memcpy(&raddr, prop_data_value(d), sizeof(raddr));
+	if (!prop_dictionary_get_string(dict, BTDEVservice, &service))
+		errx(EXIT_FAILURE, "no %s", BTDEVservice);
+
+	if (!prop_dictionary_set_bool(dict, "attached", cmd == BTDEV_ATTACH)
+	    || !db_set(dict, &laddr, &raddr, service))
+		errx(EXIT_FAILURE, "service store failed");
+
+	if ((f = fopen(BTHIDD_PIDFILE, "r")) != NULL) {
+		if (fscanf(f, "%d", &pid) == 1 && pid > 1)
+			(void)kill(pid, SIGHUP);
+		fclose(f);
+	} else
+		warnx("bthidd is not running (%s)", BTHIDD_PIDFILE);
+
+	return EXIT_SUCCESS;
+}
+#else
 static int
 bthub_pioctl(unsigned long cmd, prop_dictionary_t dict)
 {
@@ -247,3 +294,4 @@ bthub_pioctl(unsigned long cmd, prop_dictionary_t dict)
 	close(fd);
 	return EXIT_SUCCESS;
 }
+#endif
