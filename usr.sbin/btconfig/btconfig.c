@@ -1130,12 +1130,24 @@ print_result(int num, struct bt_devinquiry *r)
 	ncp.page_scan_rep_mode = r->pscan_rep_mode;
 	ncp.clock_offset = r->clock_offset;
 
+	memset(&nep, 0, sizeof(nep));
 	hci_req(HCI_CMD_REMOTE_NAME_REQ,
 		HCI_EVENT_REMOTE_NAME_REQ_COMPL,
 		&ncp, sizeof(ncp),
 		&nep, sizeof(nep));
 
-	printf("   : name \"%s\"\n", nep.name);
+	/*
+	 * hci_req() checks the status only when waiting for no event, and
+	 * Remote_Name_Request_Complete reports a failed request (page
+	 * timeout, for one) in its own status. The name is then not this
+	 * device's: Broadcom controllers return the last name they read, so
+	 * every unreachable device was printed with a neighbour's name.
+	 */
+	nep.name[sizeof(nep.name) - 1] = '\0';
+	if (nep.status == 0)
+		printf("   : name \"%s\"\n", nep.name);
+	else
+		printf("   : name unknown (status 0x%02x)\n", nep.status);
 	print_class("   : class", r->dev_class);
 	printf("   : page scan rep mode 0x%02x\n", r->pscan_rep_mode);
 	printf("   : clock offset %d\n", le16toh(r->clock_offset));
