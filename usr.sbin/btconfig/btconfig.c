@@ -40,6 +40,7 @@ __RCSID("$NetBSD: btconfig.c,v 1.28 2017/12/21 09:31:22 plunky Exp $");
 #include <sys/socket.h>
 
 #include <bluetooth.h>
+#include <netbt/hci_le.h>
 #include <err.h>
 #include <errno.h>
 #include <stdio.h>
@@ -67,6 +68,7 @@ static void print_features1(uint8_t *);
 static void print_features2(uint8_t *);
 static void print_result(int, struct bt_devinquiry *);
 static void do_inquiry(void);
+static void do_lescan(void);
 
 static void hci_req(uint16_t, uint8_t , void *, size_t, void *, size_t);
 static void save_value(uint16_t, void *, size_t);
@@ -145,6 +147,11 @@ static int opt_ssp = 0;				/* secure simple pairing */
 static int opt_inquiry = 0;
 #define INQUIRY_LENGTH		10	/* seconds */
 #define INQUIRY_MAX_RESPONSES	10
+
+/* LE scan: active scan for advertising devices (lescan) */
+static int opt_lescan = 0;
+#define LESCAN_LENGTH		6	/* seconds */
+#define LESCAN_MAX_DEVICES	64
 static const char *imodes[] = { "std", "rssi", "ext", NULL };
 
 /* Voice Settings */
@@ -194,6 +201,7 @@ static struct parameter {
 	{ "variable",	P_CLR,	&opt_pin,	NULL	},
 	{ "inq",	P_SET,	&opt_inquiry,	NULL	},
 	{ "inquiry",	P_SET,	&opt_inquiry,	NULL	},
+	{ "lescan",	P_SET,	&opt_lescan,	NULL	},
 	{ "imode",	P_VAL,	&opt_imode,	imodes	},
 	{ "ssp",	P_SET,	&opt_ssp,	NULL	},
 	{ "-ssp",	P_CLR,	&opt_ssp,	NULL	},
@@ -320,6 +328,7 @@ main(int ac, char *av[])
 		print_info(verbose);
 		print_stats();
 		do_inquiry();
+		do_lescan();
 	}
 
 	close(hci);
@@ -1181,4 +1190,248 @@ do_inquiry(void)
 		print_result(i + 1, &result[i]);
 
 	free(result);
+}
+
+/*
+ * LE scan. Bluetooth Core 5.x Vol 4 Part E: 7.8.10 LE Set Scan Parameters,
+ * 7.8.11 LE Set Scan Enable, 7.7.65.2 LE Advertising Report; AD types from
+ * Vol 3 Part C 11 and the Assigned Numbers document. The LE Meta event
+ * reaches the host because "ssp" sets event mask bit 61; LE Set Event Mask
+ * is written here anyway, Advertising Report (bit 1) being the one used.
+ *
+ * Scanning is active, so devices that keep their name for the scan
+ * response (most mice and keyboards) report it too.
+ */
+struct le_device {
+	bdaddr_t	addr;
+	uint8_t		addr_type;	/* 0 public, 1 random */
+	int		connectable;
+	int		hid;		/* advertises the HID service, 0x1812 */
+	uint16_t	appearance;
+	int		rssi;
+	char		name[HCI_UNIT_NAME_SIZE];
+	int		complete_name;
+};
+
+/* send an LE command that answers with a status; returns that status */
+static uint8_t
+le_cmd(uint16_t opcode, void *cp, size_t clen)
+{
+	struct bt_devreq req;
+	uint8_t status = 0xff;
+
+	memset(&req, 0, sizeof(req));
+	req.opcode = opcode;
+	req.cparam = cp;
+	req.clen = clen;
+	req.rparam = &status;
+	req.rlen = sizeof(status);
+	if (bt_devreq(hci, &req, 5) == -1)
+		err(EXIT_FAILURE, "cmd (%02x|%03x)",
+		    HCI_OGF(opcode), HCI_OCF(opcode));
+	return status;
+}
+
+static void
+le_scan_enable(int on)
+{
+	hci_le_set_scan_enable_cp cp;
+
+	cp.scan_enable = on ? 1 : 0;
+	cp.filter_dup = 0;	/* a scan response must not be dropped as a dup */
+	(void)le_cmd(HCF_CMD_LE_SET_SCAN_ENABLE, &cp, sizeof(cp));
+}
+
+static const char *
+appearance_name(uint16_t a)
+{
+	switch (a >> 6) {	/* category: Assigned Numbers 2.6 */
+	case 0x01:	return "phone";
+	case 0x02:	return "computer";
+	case 0x03:	return "watch";
+	case 0x0f:
+		switch (a & 0x3f) {
+		case 0x01:	return "keyboard";
+		case 0x02:	return "mouse";
+		case 0x03:	return "joystick";
+		case 0x04:	return "gamepad";
+		case 0x05:	return "digitizer tablet";
+		case 0x07:	return "barcode scanner";
+		case 0x09:	return "touchpad";
+		case 0x0a:	return "presentation remote";
+		default:	return "human interface device";
+		}
+	default:	return NULL;
+	}
+}
+
+static void
+le_parse_ad(struct le_device *d, const uint8_t *p, size_t n)
+{
+	size_t len, i;
+	uint8_t type;
+
+	while (n >= 2) {
+		len = p[0];
+		if (len == 0 || len + 1 > n)
+			break;
+		type = p[1];
+		switch (type) {
+		case 0x08:	/* Shortened Local Name */
+		case 0x09:	/* Complete Local Name */
+			if (type == 0x08 && d->complete_name)
+				break;
+			i = len - 1;
+			if (i > sizeof(d->name) - 1)
+				i = sizeof(d->name) - 1;
+			memcpy(d->name, p + 2, i);
+			d->name[i] = '\0';
+			d->complete_name = (type == 0x09);
+			break;
+		case 0x19:	/* Appearance */
+			if (len >= 3)
+				d->appearance = p[2] | (p[3] << 8);
+			break;
+		case 0x02:	/* Incomplete List of 16-bit Service UUIDs */
+		case 0x03:	/* Complete List of 16-bit Service UUIDs */
+			for (i = 2; i + 1 < len + 1; i += 2)
+				if ((p[i] | (p[i + 1] << 8)) == 0x1812)
+					d->hid = 1;
+			break;
+		}
+		p += len + 1;
+		n -= len + 1;
+	}
+}
+
+static void
+do_lescan(void)
+{
+	struct le_device devs[LESCAN_MAX_DEVICES], *d;
+	struct bt_devfilter f, old;
+	hci_le_set_scan_param_cp sp;
+	uint8_t buf[HCI_EVENT_PKT_SIZE + sizeof(hci_event_hdr_t)], *p, *end;
+	uint8_t mask[8], status;
+	time_t t_end, to;
+	ssize_t n;
+	int ndev = 0, i, nrep;
+	const char *a;
+
+	if (opt_lescan == 0)
+		return;
+
+	printf("LE scan from device: %s ...", btr.btr_name);
+	fflush(stdout);
+
+	/* a scan left on (an earlier run killed) refuses new parameters */
+	le_scan_enable(0);
+
+	memset(mask, 0, sizeof(mask));
+	mask[0] = 0x1f;		/* the default: Connection Complete .. LTK Request */
+	(void)le_cmd(HCI_CMD_LE_SET_EVENT_MASK, mask, sizeof(mask));
+
+	memset(&sp, 0, sizeof(sp));
+	sp.scan_type = 1;			/* active */
+	sp.scan_interval = htole16(0x0060);	/* 60 ms */
+	sp.scan_window = htole16(0x0030);	/* 30 ms: leaves room for BR/EDR */
+	sp.own_address_type = 0;		/* public */
+	sp.scan_filter_policy = 0;		/* everything */
+	status = le_cmd(HCI_CMD_LE_SET_SCAN_PARAM, &sp, sizeof(sp));
+	if (status != 0)
+		errx(EXIT_FAILURE, "LE Set Scan Parameters: status 0x%02x", status);
+
+	memset(&f, 0, sizeof(f));
+	bt_devfilter_pkt_set(&f, HCI_EVENT_PKT);
+	bt_devfilter_evt_set(&f, HCI_LE_META_EVENT);
+	if (bt_devfilter(hci, &f, &old) == -1)
+		err(EXIT_FAILURE, "event filter");
+
+	{
+		hci_le_set_scan_enable_cp cp = { 1, 0 };
+
+		status = le_cmd(HCF_CMD_LE_SET_SCAN_ENABLE, &cp, sizeof(cp));
+		if (status != 0) {
+			(void)bt_devfilter(hci, &old, NULL);
+			errx(EXIT_FAILURE, "LE Set Scan Enable: status 0x%02x", status);
+		}
+	}
+	/* le_cmd() set its own filter and put ours back; set it again */
+	(void)bt_devfilter(hci, &f, NULL);
+
+	t_end = time(NULL) + LESCAN_LENGTH;
+	for (;;) {
+		to = t_end - time(NULL);
+		if (to <= 0)
+			break;
+		n = bt_devrecv(hci, buf, sizeof(buf), to);
+		if (n == -1) {
+			if (errno == ETIMEDOUT || errno == EAGAIN || errno == EINTR)
+				break;
+			warn("LE scan");
+			break;
+		}
+		/* event packet: type, event code, length, subevent, num reports */
+		if (n < 5 || buf[0] != HCI_EVENT_PKT || buf[1] != HCI_LE_META_EVENT
+		    || buf[3] != 0x02 /* LE Advertising Report */)
+			continue;
+		end = buf + n;
+		nrep = buf[4];
+		p = buf + 5;
+		/*
+		 * Each report: event type, address type, address (6), data
+		 * length, data, RSSI. Controllers send one report per event;
+		 * read them in sequence as Linux hci_le_adv_report_evt does.
+		 */
+		while (nrep-- > 0 && p + 9 <= end) {
+			uint8_t evt = p[0], atype = p[1], dlen = p[8];
+			const uint8_t *data = p + 9;
+			bdaddr_t ba;
+
+			if (data + dlen + 1 > end)
+				break;
+			memcpy(&ba, p + 2, sizeof(ba));
+			d = NULL;
+			for (i = 0; i < ndev; i++)
+				if (bdaddr_same(&devs[i].addr, &ba)
+				    && devs[i].addr_type == atype)
+					d = &devs[i];
+			if (d == NULL && ndev < LESCAN_MAX_DEVICES) {
+				d = &devs[ndev++];
+				memset(d, 0, sizeof(*d));
+				bdaddr_copy(&d->addr, &ba);
+				d->addr_type = atype;
+			}
+			if (d != NULL) {
+				/* ADV_IND and ADV_DIRECT_IND accept connections */
+				if (evt == 0x00 || evt == 0x01)
+					d->connectable = 1;
+				le_parse_ad(d, data, dlen);
+				d->rssi = (int8_t)data[dlen];
+			}
+			p = (uint8_t *)data + dlen + 1;
+		}
+	}
+
+	le_scan_enable(0);
+	(void)bt_devfilter(hci, &old, NULL);
+
+	printf(" %d device%s\n", ndev, (ndev == 1 ? "" : "s"));
+	for (i = 0; i < ndev; i++) {
+		d = &devs[i];
+		printf("%3d: bdaddr %s\n", i + 1, bt_ntoa(&d->addr, NULL));
+		printf("   : address %s\n", d->addr_type == 0 ? "public"
+		    : d->addr_type == 1 ? "random" : "other");
+		if (d->name[0] != '\0')
+			printf("   : name \"%s\"\n", d->name);
+		if (d->appearance != 0) {
+			a = appearance_name(d->appearance);
+			printf("   : appearance [0x%04x]%s%s\n", d->appearance,
+			    a ? " " : "", a ? a : "");
+		}
+		if (d->hid)
+			printf("   : service HID\n");
+		printf("   : %sconnectable\n", d->connectable ? "" : "not ");
+		printf("   : rssi %d\n", d->rssi);
+		printf("\n");
+	}
 }

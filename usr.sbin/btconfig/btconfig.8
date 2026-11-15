@@ -138,6 +138,10 @@ Set fixed pin type.
 Set variable pin type.
 .It Cm inquiry
 Perform device Discovery from the specified device and print details.
+.It Cm lescan
+Perform an active Bluetooth Low Energy scan for six seconds and print each
+advertising device: address and address type, then the name, appearance and
+HID service when advertised, whether it accepts connections, and the RSSI.
 .It Cm imode Ar type
 Set inquiry mode type to control which event formats are generated during
 a device inquiry.
